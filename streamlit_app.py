@@ -1,193 +1,201 @@
 # streamlit_app.py
+# ===============================================================
+# 🔋 Contractor-Ladepark-Simulator  –  Spot-Arbitrage | Kreditplan
+# Version 4.3  |  enthält
+#   • Live-Day-Ahead-Preise (ENTSO-E)  + Retry + 24 h-Cache
+#   • Fester EV-Preis  +  jährliche Inflation EV-Preis / Opex
+#   • THG-Bonus (€/kWh)  als Zusatzumsatz
+#   • Wahl: 100 % Eigenkapital  ODER  Kredit-Finanzierung
+#        - Kreditanteil %, Zins %, Laufzeit J
+#        - Vollständiger Amortisationsplan (Zins / Tilgung / Restschuld)
+#   • KPIs:  NPV @ Diskont,  IRR,  Break-Even-Jahr,  Zyklen
+# ===============================================================
+
 import os, datetime as dt
+import numpy as np, pandas as pd
 import requests, requests_cache
-import pandas as pd
-import numpy as np
 import streamlit as st
 import matplotlib.pyplot as plt
 
-"""
-🔋 Stromspeicher-Simulator v4.2 – Contractor, Inflation, THG-Quote
------------------------------------------------------------------
-• Live-Day-Ahead- & CO₂-Daten (ENTSO-E API + Retry & 24-h-Cache)
-• Fester EV-Ladepreis  +  jährliche Inflation (EV-Preis % / Opex %)
-• THG-Quote (Bonus €/kWh) als zusätzliche Einnahme
-• Gewinnaufteilung Contractor / Standort
-• KPIs: NPV @ Diskont, IRR, Break-Even, Zyklen
-"""
-
-# ---------------------------------------------------------------------------
-# 🔗  ENT­SO-E  API  –  Cache + Retry
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 1)  ENT-SO-E API  — Cache & Retry
+# ------------------------------------------------------------------
 CACHE_DB = "/tmp/entsoe_cache.sqlite"
-requests_cache.install_cache(CACHE_DB, expire_after=60 * 60 * 24)      # 24 h
+requests_cache.install_cache(CACHE_DB, expire_after=60 * 60 * 24)   # 24 h
+
+from requests.adapters import HTTPAdapter, Retry
 session = requests_cache.CachedSession()
-session.mount(
-    "https://",
-    requests.adapters.HTTPAdapter(max_retries=requests.adapters.Retry(total=3, backoff_factor=1)),
-)
+session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
 
 ENTSOE_URL   = "https://transparency.entsoe.eu/api"
-BIDDING_ZONE = "10Y1001A1001A83"          # DE-LU
+BIDDING_ZONE = "10Y1001A1001A83"           # DE-LU
 
-def _get_xml(params: dict) -> str:
+def _xml(params: dict) -> str:
     r = session.get(ENTSOE_URL, params=params, timeout=60)
     r.raise_for_status()
     return r.text
 
-def fetch_day_ahead(start: dt.datetime, end: dt.datetime, api_key: str) -> pd.DataFrame:
-    params = {
-        "documentType": "A44", "processType": "A01",
-        "in_Domain": BIDDING_ZONE, "out_Domain": BIDDING_ZONE,
-        "periodStart": start.strftime("%Y%m%d%H%M"),
-        "periodEnd"  : end.strftime("%Y%m%d%H%M"),
-        "securityToken": api_key,
-    }
-    xml = _get_xml(params)
-    df  = pd.read_xml(xml, xpath="//Point")
+def fetch_day_ahead(start: dt.datetime, end: dt.datetime, token: str) -> pd.DataFrame:
+    p = dict(documentType="A44", processType="A01",
+             in_Domain=BIDDING_ZONE, out_Domain=BIDDING_ZONE,
+             periodStart=start.strftime("%Y%m%d%H%M"),
+             periodEnd=end.strftime("%Y%m%d%H%M"),
+             securityToken=token)
+    df = pd.read_xml(_xml(p), xpath="//Point")
     df["Zeit"] = pd.to_datetime(df["position"].astype(int) - 1, unit="h", origin=start)
-    df.rename(columns={"price.amount": "Preis_EUR_MWh"}, inplace=True)
-    return df[["Zeit", "Preis_EUR_MWh"]]
+    return df[["Zeit"]].assign(Preis_EUR_MWh=df["price.amount"])
 
-def fetch_co2_intensity(start: dt.datetime, end: dt.datetime, api_key: str) -> pd.DataFrame:
-    params = {
-        "documentType": "A75", "processType": "A16",
-        "in_Domain": BIDDING_ZONE,
-        "periodStart": start.strftime("%Y%m%d%H%M"),
-        "periodEnd"  : end.strftime("%Y%m%d%H%M"),
-        "securityToken": api_key,
-    }
-    xml = _get_xml(params)
-    df  = pd.read_xml(xml, xpath="//Point")
-    df["Zeit"] = pd.to_datetime(df["position"].astype(int) - 1, unit="h", origin=start)
-    df.rename(columns={"quantity": "CO2_g_per_kWh"}, inplace=True)
-    return df[["Zeit", "CO2_g_per_kWh"]]
+# ------------------------------------------------------------------
+# 2)  Darlehens-Amortisationsplan
+# ------------------------------------------------------------------
+def amort_schedule(principal: float, rate: float, years: int) -> pd.DataFrame:
+    """gibt DataFrame mit Jahr, Zins, Tilgung, Rate, Restschuld"""
+    if principal <= 0 or years <= 0:
+        return pd.DataFrame()
+    ann = principal * (rate * (1 + rate) ** years) / ((1 + rate) ** years - 1)
+    rows, bal = [], principal
+    for y in range(1, years + 1):
+        interest = bal * rate
+        principal_pay = ann - interest
+        bal = max(bal - principal_pay, 0)
+        rows.append(dict(Jahr=y, Zins=interest, Tilgung=principal_pay,
+                         Rate=ann, Restschuld=bal))
+    return pd.DataFrame(rows)
 
-# ---------------------------------------------------------------------------
-# 🔋  Simulation  (Inflation + THG Quote)
-# ---------------------------------------------------------------------------
-def simulate(prices: pd.DataFrame, co2: pd.DataFrame, cfg: dict):
+# ------------------------------------------------------------------
+# 3)  Haupt-Simulation   (Inflation + THG + Finanzierung)
+# ------------------------------------------------------------------
+def simulate(prices: pd.DataFrame, cfg: dict):
     prices = prices.copy()
     prices["Datum"] = prices["Zeit"].dt.date
 
-    # Verkaufsfenster-Flag
-    def in_sell_window(ts: pd.Timestamp) -> bool:
+    # Flag „Sell“ nach Verkaufsfenster
+    def in_window(t: dt.time) -> bool:
         if cfg["sell_start"] < cfg["sell_end"]:
-            return cfg["sell_start"] <= ts.time() <= cfg["sell_end"]
-        return ts.time() >= cfg["sell_start"] or ts.time() <= cfg["sell_end"]
+            return cfg["sell_start"] <= t <= cfg["sell_end"]
+        return t >= cfg["sell_start"] or t <= cfg["sell_end"]
 
-    prices["Sell"] = prices["Zeit"].apply(in_sell_window)
-    if not co2.empty:
-        prices = prices.merge(co2, on="Zeit", how="left")
-    else:
-        prices["CO2_g_per_kWh"] = np.nan
+    prices["Sell"] = prices["Zeit"].dt.time.apply(in_window)
 
-    need_hours = int(np.ceil(cfg["cap"] / cfg["conn"]))
-    daily, cycles = [], 0
+    need_h = int(np.ceil(cfg["cap_MWh"] / cfg["conn_MW"]))
+    cycles, daily = 0, []
 
-    # -------- Jahr 0 (Basisjahr) Tagesgewinne --------
-    for d, grp in prices.groupby("Datum"):
-        load_hours = grp.nsmallest(need_hours, "Preis_EUR_MWh")
-        sell_hours = grp[grp["Sell"]]
-        if sell_hours.empty:
+    for d, g in prices.groupby("Datum"):
+        load = g.nsmallest(need_h, "Preis_EUR_MWh")
+        sell = g[g["Sell"]]
+        if sell.empty:
             continue
+        buy_price = load["Preis_EUR_MWh"].mean()
+        sell_price_MWh = (cfg["ev_price"] + cfg["thg_bonus"]) * 1_000
 
-        buy_p   = load_hours["Preis_EUR_MWh"].mean()
-        sell_pMWh = (cfg["ev_price"] + cfg["thg"]) * 1_000     # €/MWh
+        e_in  = cfg["cap_MWh"] * (1 + cfg["loss_in"])
+        e_out = cfg["cap_MWh"] * (1 - cfg["loss_out"])
 
-        e_charge = cfg["cap"] * (1 + cfg["closs"])
-        e_sell   = cfg["cap"] * (1 - cfg["dloss"])
+        peak_ratio = sell["Zeit"].dt.hour.between(8, 20).mean()
+        net_cost   = e_in * (peak_ratio * cfg["net_peak"] +
+                             (1 - peak_ratio) * cfg["net_off"])
 
-        revenue  = e_sell * sell_pMWh
-        energy_c = e_charge * buy_p
-
-        peak_ratio = sell_hours["Zeit"].dt.hour.between(8, 20).mean()
-        net_cost   = e_charge * (peak_ratio * cfg["net_peak"] +
-                                 (1 - peak_ratio) * cfg["net_off"])
-
-        profit = revenue - energy_c - net_cost
+        profit = e_out * sell_price_MWh - e_in * buy_price - net_cost
         cycles += 1
-        daily.append({"Datum": pd.to_datetime(d), "Gewinn": profit})
+        daily.append(dict(Datum=pd.to_datetime(d), Gewinn=profit))
 
     df = pd.DataFrame(daily)
 
-    # -------- Kosten & Cashflow Jahr 0 --------
+    # ---------- Jahr 0 ----------
     deg_cost = cycles * (cfg["capex"] / cfg["max_cycles"])
-    opex_y0  = cfg["opex"]
+    opex0    = cfg["opex"]
+    gross0   = df["Gewinn"].sum()
+    net0     = gross0 - deg_cost - opex0             # vor Gewinn­aufteilung
 
-    gross_y0 = df["Gewinn"].sum()
-    net_y0   = gross_y0 - deg_cost - opex_y0
+    # ---------- Finanzierung ----------
+    if cfg["fin_mode"] == "Kredit":
+        schedule = amort_schedule(cfg["loan_principal"],
+                                  cfg["loan_rate"],
+                                  cfg["loan_years"])
+        equity_out = cfg["capex"] - cfg["loan_principal"]
+    else:                                            # 100 % Eigenkapital
+        schedule = pd.DataFrame()
+        equity_out = cfg["capex"]
 
-    contractor_y0 = net_y0 * (1 - cfg["share"])
-    cashflows = [-cfg["capex"], contractor_y0]
+    cashflows = [-equity_out]                    # t = 0
 
-    # -------- Jahre 1 … n  (mit Inflation) --------
-    for year in range(1, cfg["years"] + 1):
-        infl_factor_ev  = (1 + cfg["infl_ev"]) ** year
-        infl_factor_opx = (1 + cfg["infl_op"]) ** year
+    # ---------- Jahres-Cash-Flows ----------
+    for y in range(1, cfg["years"] + 1):
+        infl_ev   = (1 + cfg["infl_ev"])  ** y
+        infl_opex = (1 + cfg["infl_op"]) ** y
+        gross_y   = gross0 * infl_ev
+        opex_y    = opex0 * infl_opex
+        net_y     = gross_y - deg_cost - opex_y
 
-        revenue_y = gross_y0 * infl_factor_ev
-        opex_y    = cfg["opex"] * infl_factor_opx
+        # Kreditrate?
+        rate_y = schedule.loc[schedule["Jahr"] == y, "Rate"].iloc[0] if not schedule.empty and y <= cfg["loan_years"] else 0
+        contractor_share = (net_y - rate_y) * (1 - cfg["share_site"])
+        cashflows.append(contractor_share)
 
-        net_y = revenue_y - deg_cost - opex_y
-        contractor_y = net_y * (1 - cfg["share"])
-        cashflows.append(contractor_y)
-
-    # -------- KPIs --------
-    disc = cfg["disc"]
+    # ---------- KPIs ----------
+    disc = cfg["discount"]
     npv = sum(cf / (1 + disc) ** t for t, cf in enumerate(cashflows))
     try:
         irr = np.irr(cashflows)
     except Exception:
         irr = np.nan
-    breakeven = next((t for t, c in enumerate(np.cumsum(cashflows)) if c >= 0), None)
+    be_year = next((t for t, c in enumerate(np.cumsum(cashflows)) if c >= 0), None)
 
-    summary = dict(NPV=npv, IRR=irr, BE=breakeven, cycles=cycles)
+    summary = dict(NPV=npv, IRR=irr, BE=be_year, cycles=cycles, schedule=schedule)
     return df, summary
 
-# ---------------------------------------------------------------------------
-# 🚀  Streamlit Frontend
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 4)  Streamlit Frontend
+# ------------------------------------------------------------------
 def main() -> None:
-    st.set_page_config(page_title="Contractor-Simulator v4.2", layout="wide")
-    st.title("🔋 Contractor-Ladepark – Inflation, THG-Quote, Retry-Cache")
+    st.set_page_config(page_title="Contractor v4.3", layout="wide")
+    st.title("🔋 Contractor-Simulator – Kreditplan, Inflation, THG")
 
-    # -------- Sidebar: Basis --------
-    api_key = st.sidebar.text_input("ENTSO-E API-Key",
-                                    os.getenv("ENTSOE_API_KEY", ""),
-                                    type="password")
-    year = st.sidebar.selectbox("Startjahr", [2023, 2024, 2025], 0)
+    # -------- API & Jahr --------
+    api_key = st.sidebar.text_input("ENTSO-E API-Key", os.getenv("ENTSOE_API_KEY", ""), type="password")
+    year    = st.sidebar.selectbox("Startjahr", [2023, 2024, 2025], 0)
 
     # -------- Batterie --------
     st.sidebar.header("🔋 Batterie")
-    cap  = st.sidebar.number_input("Speicher (MWh)", 0.5, 20.0, 3.5, 0.1)
-    conn = st.sidebar.number_input("Netzanschluss (MW)", 0.1, 5.0, 0.35, 0.05)
-    closs = st.sidebar.slider("Ladeverlust %", 0, 20, 5) / 100
-    dloss = st.sidebar.slider("Entladeverlust %", 0, 20, 5) / 100
+    cap_MWh  = st.sidebar.number_input("Speicher (MWh)", 0.5, 20.0, 3.5, 0.1)
+    conn_MW  = st.sidebar.number_input("Netzanschluss (MW)", 0.1, 5.0, 0.35, 0.05)
+    loss_in  = st.sidebar.slider("Ladeverluste % ", 0, 20, 5) / 100
+    loss_out = st.sidebar.slider("Entladeverluste %", 0, 20, 5) / 100
 
-    # -------- EV-Preis + Inflation --------
-    st.sidebar.header("🚗 EV-Preis & Inflation")
+    # -------- Preise & Inflation --------
+    st.sidebar.header("🚗 EV-Preis & THG")
     ev_price = st.sidebar.number_input("EV-Preis €/kWh", 0.10, 1.00, 0.285, 0.005)
     infl_ev  = st.sidebar.slider("Inflation EV-Preis %/a", 0.0, 10.0, 2.0) / 100
+    thg_bonus= st.sidebar.number_input("THG-Bonus €/kWh", 0.0, 0.50, 0.20, 0.01)
 
-    # -------- Opex + Inflation --------
-    st.sidebar.header("⚙️ Opex & Inflation")
-    opex   = st.sidebar.number_input("Opex €/Jahr", 0, 50_000, 5_000, 500)
+    # -------- Opex & Inflation --------
+    st.sidebar.header("⚙️ Betriebskosten")
+    opex    = st.sidebar.number_input("Opex €/Jahr", 0, 50_000, 5_000, 500)
     infl_op = st.sidebar.slider("Inflation Opex %/a", 0.0, 10.0, 2.0) / 100
 
-    # -------- THG-Quote --------
-    st.sidebar.header("🌱 THG-Quote")
-    thg_bonus = st.sidebar.number_input("THG-Bonus €/kWh", 0.0, 0.5, 0.20, 0.01)
-
-    # -------- CAPEX & Laufzeit --------
-    st.sidebar.header("💰 CAPEX & Laufzeit")
+    # -------- CAPEX & Finanzierung --------
+    st.sidebar.header("💰 CAPEX & Finanzierung")
     capex      = st.sidebar.number_input("CAPEX €", 10_000, 2_000_000, 350_000, 5_000)
     max_cycles = st.sidebar.number_input("Max. Zyklen", 1_000, 15_000, 6_000, 100)
-    years      = st.sidebar.number_input("Vertragsjahre", 5, 20, 10, 1)
-    discount   = st.sidebar.number_input("Diskont % p.a.", 0.0, 15.0, 6.0) / 100
-    share      = st.sidebar.slider("Anteil Standort %", 0, 50, 20) / 100
+    fin_mode   = st.sidebar.selectbox("Finanzierung", ["Eigenkapital", "Kredit"], 0)
 
-    # -------- Netzentgelt --------
+    if fin_mode == "Kredit":
+        loan_share   = st.sidebar.slider("Fremdkapitalanteil %", 10, 100, 70)
+        loan_rate    = st.sidebar.number_input("Zins % p.a.", 0.0, 15.0, 4.0, 0.1) / 100
+        loan_years   = st.sidebar.number_input("Laufzeit J", 1, 20, 10, 1)
+        loan_principal = capex * loan_share / 100
+    else:
+        loan_principal = 0
+        loan_rate      = 0
+        loan_years     = 0
+
+    # -------- Vertrag --------
+    st.sidebar.header("📑 Vertrag & Diskont")
+    years    = st.sidebar.number_input("Vertragsjahre", 5, 20, 10, 1)
+    discount = st.sidebar.number_input("Diskont % p.a.", 0.0, 15.0, 6.0) / 100
+    share_site = st.sidebar.slider("Gewinnanteil Standort %", 0, 50, 20) / 100
+
+    # -------- Netz --------
     st.sidebar.header("🔌 Netzentgelt")
     net_peak = st.sidebar.number_input("Peak €/MWh", 0, 200, 75, 5)
     net_off  = st.sidebar.number_input("Off-Peak €/MWh", 0, 200, 40, 5)
@@ -197,12 +205,12 @@ def main() -> None:
     sell_start = st.sidebar.time_input("Start", dt.time(0, 0))
     sell_end   = st.sidebar.time_input("Ende",  dt.time(23, 59))
 
-    # -------- Simulation --------
+    # -------- Simulation drücken --------
     if st.button("Simulation starten"):
         start = dt.datetime(year, 1, 1)
         end   = dt.datetime(year, 12, 31, 23)
 
-        # Preise
+        # Preise holen
         try:
             with st.spinner("Day-Ahead-Preise laden …"):
                 prices = fetch_day_ahead(start, end, api_key)
@@ -210,38 +218,50 @@ def main() -> None:
             st.error(f"🚫 API-Fehler: {e}")
             st.stop()
 
-        # CO₂ (optional)
-        try:
-            co2 = fetch_co2_intensity(start, end, api_key)
-        except Exception:
-            co2 = pd.DataFrame()
-
         cfg = dict(
-            cap=cap, conn=conn, closs=closs, dloss=dloss,
+            cap_MWh=cap_MWh, conn_MW=conn_MW,
+            loss_in=loss_in, loss_out=loss_out,
             ev_price=ev_price, infl_ev=infl_ev,
             opex=opex, infl_op=infl_op,
-            thg=thg_bonus,
+            thg_bonus=thg_bonus,
             capex=capex, max_cycles=max_cycles,
-            years=years, disc=discount, share=share,
+            fin_mode=fin_mode,
+            loan_principal=loan_principal,
+            loan_rate=loan_rate,
+            loan_years=loan_years,
+            years=years, discount=discount,
+            share_site=share_site,
             net_peak=net_peak, net_off=net_off,
             sell_start=sell_start, sell_end=sell_end
         )
 
-        df, summ = simulate(prices, co2, cfg)
-        st.success("✅ Simulation fertig")
+        df, summ = simulate(prices, cfg)
 
+        st.success("✅ Simulation abgeschlossen")
+
+        # KPIs
         k1, k2, k3 = st.columns(3)
         k1.metric("NPV €", f"{summ['NPV']:,.0f}")
         k2.metric("IRR %", f"{summ['IRR']*100:,.2f}" if not np.isnan(summ["IRR"]) else "n/a")
         k3.metric("Break-Even Jahr", summ["BE"] if summ["BE"] is not None else "> Laufzeit")
 
-        st.subheader("Tagesgewinne (Jahr 0)")
+        # Kreditplan anzeigen
+        if not summ["schedule"].empty:
+            st.subheader("📑 Darlehensplan")
+            st.dataframe(
+                summ["schedule"].style.format(
+                    {"Zins": "{:,.0f}", "Tilgung": "{:,.0f}",
+                     "Rate": "{:,.0f}", "Restschuld": "{:,.0f}"}
+                )
+            )
+
+        st.subheader("Tagesgewinne Jahr 0")
         st.dataframe(df)
 
         st.download_button("CSV herunterladen",
                            df.to_csv(index=False).encode(),
                            file_name="contractor_detail.csv")
 
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------
 if __name__ == "__main__":
     main()
