@@ -27,7 +27,7 @@ from requests.adapters import HTTPAdapter, Retry
 session = requests_cache.CachedSession()
 session.mount("https://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1)))
 
-ENTSOE_URL   = "https://transparency.entsoe.eu/api"
+ENTSOE_URL   = "https://web-api.tp.entsoe.eu/api"
 BIDDING_ZONE = "10Y1001A1001A83"           # DE-LU
 
 def _xml(params: dict) -> str:
