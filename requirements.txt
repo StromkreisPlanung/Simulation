@@ -2,4 +2,5 @@ streamlit
 pandas
 numpy
 requests
+requests_cache
 matplotlib
