@@ -7,62 +7,49 @@ import streamlit as st
 import matplotlib.pyplot as plt
 
 """
-Stromspeicher Spotmarkt Simulator – Version API & CO₂
-====================================================
-Diese Version bindet Live‑Daten der ENTSO‑E Transparency Platform ein und kombiniert sie
-mit einem erweiterten Batteriemodell (Verluste, Degradation) sowie CO₂‑ und
-Netzentgelt‑Berechnung. Finanzierungsmodelle folgen in Phase 4.
+Stromspeicher Simulator –– Live‑API v3
+=====================================
+Erweiterungen:
+1. **Finanzierungs­module**: Kauf, Kredit (Annuität), Leasing
+2. **Heatmaps / Monats‑Cashflows**: tägliche & monatliche Visualisierung
+3. Weiterhin: Live‑Preise & CO₂‑Daten (ENTSO‑E)
 
-⚠️ Wichtig: Der Nutzer muss einen gültigen ENTSO‑E API‑Key als Umgebungsvariable
-    ENTSOE_API_KEY setzen (oder im Sidebar‑Feld eingeben).
+Hinweis: ENTSO‑E‑API‑Key als Umgebungs­variable `ENTSOE_API_KEY` oder im Sidebar angeben.
 """
 
 # -----------------------------------------------------------------------------
-# 🗝️ API Utility Layer
+# 🔗 ENTSO‑E API Layer
 # -----------------------------------------------------------------------------
 ENTSOE_ENDPOINT = "https://transparency.entsoe.eu/api"
-# Bidding‑Zone für Deutschland/Luxemburg (DE‑LU)
-BIDDING_ZONE = "10Y1001A1001A83"
+BIDDING_ZONE = "10Y1001A1001A83"  # DE‑LU
 
-
-def fetch_day_ahead_prices(start: dt.datetime, end: dt.datetime, domain: str = BIDDING_ZONE, api_key: str | None = None) -> pd.DataFrame:
-    """Holt Day‑Ahead‑Preise (HOURLY) von ENTSO‑E und gibt DataFrame zurück."""
-    if api_key is None:
-        raise ValueError("ENTSOE API‑Key fehlt – bitte Umgebungsvariable ENTSOE_API_KEY setzen oder im Sidebar eingeben.")
-
+def fetch_day_ahead_prices(start: dt.datetime, end: dt.datetime, api_key: str, domain: str = BIDDING_ZONE) -> pd.DataFrame:
     params = {
-        "documentType": "A44",          # Day‑Ahead prices
-        "processType": "A01",            # Realtime process
+        "documentType": "A44",
+        "processType": "A01",
         "in_Domain": domain,
         "out_Domain": domain,
-        "periodStart": start.strftime("%Y%m%d%H%M"),  # im Format YYYYMMDDHHMM
+        "periodStart": start.strftime("%Y%m%d%H%M"),
         "periodEnd": end.strftime("%Y%m%d%H%M"),
         "securityToken": api_key,
     }
-
-    r = requests.get(ENTSOE_ENDPOINT, params=params, timeout=30)
+    r = requests.get(ENTSOE_ENDPOINT, params=params, timeout=60)
     r.raise_for_status()
-    # ENTSO‑E liefert XML → mit pandas read_xml auslesen
     df = pd.read_xml(r.text, xpath="//Point")
     df["Zeit"] = pd.to_datetime(df["position"].astype(int) - 1, unit="h", origin=start)
     df.rename(columns={"price.amount": "Preis_EUR_MWh"}, inplace=True)
     return df[["Zeit", "Preis_EUR_MWh"]]
 
-
-def fetch_co2_intensity(start: dt.datetime, end: dt.datetime, domain: str = BIDDING_ZONE, api_key: str | None = None) -> pd.DataFrame:
-    """Holt CO₂‑Intensität des Strommix (gCO2/kWh) von ENTSO‑E."""
-    if api_key is None:
-        raise ValueError("ENTSOE API‑Key fehlt – bitte Umgebungsvariable ENTSOE_API_KEY setzen oder im Sidebar eingeben.")
-
+def fetch_co2_intensity(start: dt.datetime, end: dt.datetime, api_key: str, domain: str = BIDDING_ZONE) -> pd.DataFrame:
     params = {
-        "documentType": "A75",          # Emissions per production type
-        "processType": "A16",            # Day‑ahead forecast
+        "documentType": "A75",
+        "processType": "A16",
         "in_Domain": domain,
         "periodStart": start.strftime("%Y%m%d%H%M"),
         "periodEnd": end.strftime("%Y%m%d%H%M"),
         "securityToken": api_key,
     }
-    r = requests.get(ENTSOE_ENDPOINT, params=params, timeout=30)
+    r = requests.get(ENTSOE_ENDPOINT, params=params, timeout=60)
     r.raise_for_status()
     df = pd.read_xml(r.text, xpath="//Point")
     df["Zeit"] = pd.to_datetime(df["position"].astype(int) - 1, unit="h", origin=start)
@@ -70,155 +57,201 @@ def fetch_co2_intensity(start: dt.datetime, end: dt.datetime, domain: str = BIDD
     return df[["Zeit", "CO2_g_per_kWh"]]
 
 # -----------------------------------------------------------------------------
-# 🔋 Batterie‑ & Business‑Logik
+# 🔋 Simulation Core
 # -----------------------------------------------------------------------------
 
-def battery_simulation(prices: pd.DataFrame,
-                       co2: pd.DataFrame | None,
-                       speicher_mwh: float,
-                       anschluss_mw: float,
-                       ladeverlust: float,
-                       entladeverlust: float,
-                       aufschlag_eur_mwh: float,
-                       verkauf_von: dt.time,
-                       verkauf_bis: dt.time,
-                       max_zyklen: int,
-                       batteriekosten: float,
-                       betriebskosten: float,
-                       degradation_pro_zyklus: float,
-                       netzentgelt_peak: float,
-                       netzentgelt_offpeak: float) -> pd.DataFrame:
-    """Simuliert Lade‑/Verkaufsstrategie + Kosten & CO₂."""
+def simulate(prices: pd.DataFrame,
+             co2: pd.DataFrame,
+             cfg: dict) -> tuple[pd.DataFrame, dict]:
     prices = prices.copy()
     prices["Datum"] = prices["Zeit"].dt.date
 
-    def is_sell_window(ts: pd.Timestamp) -> bool:
-        if verkauf_von < verkauf_bis:
-            return verkauf_von <= ts.time() <= verkauf_bis
-        return ts.time() >= verkauf_von or ts.time() <= verkauf_bis
+    # Verkaufszeitfenster
+    def in_sell_window(ts: pd.Timestamp) -> bool:
+        if cfg["sell_start"] < cfg["sell_end"]:
+            return cfg["sell_start"] <= ts.time() <= cfg["sell_end"]
+        return ts.time() >= cfg["sell_start"] or ts.time() <= cfg["sell_end"]
 
-    prices["Verkaufszeit"] = prices["Zeit"].apply(is_sell_window)
-
-    if co2 is not None and not co2.empty:
-        prices = prices.merge(co2, on="Zeit", how="left")
-    else:
-        prices["CO2_g_per_kWh"] = np.nan
+    prices["Sell"] = prices["Zeit"].apply(in_sell_window)
+    prices = prices.merge(co2, on="Zeit", how="left")
 
     results = []
-    zyklen = 0
-    for datum, grp in prices.groupby("Datum"):
-        stunden_needed = int(np.ceil(speicher_mwh / anschluss_mw))
-        # günstigste Lade‑Stunden
-        lade_hours = grp.nsmallest(stunden_needed, "Preis_EUR_MWh")
-        avg_buy_price = lade_hours["Preis_EUR_MWh"].mean()
-        energy_charged = speicher_mwh * (1 + ladeverlust)
+    cycles = 0
+    need_hours = int(np.ceil(cfg["capacity"] / cfg["connection"]))
 
-        # Verkauf innerhalb Fensters
-        sell_window = grp[grp["Verkaufszeit"]]
+    for d, grp in prices.groupby("Datum"):
+        load_hours = grp.nsmallest(need_hours, "Preis_EUR_MWh")
+        sell_window = grp[grp["Sell"]]
         if sell_window.empty:
             continue
-        avg_sell_price = sell_window["Preis_EUR_MWh"].mean() + aufschlag_eur_mwh
-        energy_sold = speicher_mwh * (1 - entladeverlust)
 
-        umsatz = energy_sold * avg_sell_price
-        energiekosten = energy_charged * avg_buy_price
+        buy_price = load_hours["Preis_EUR_MWh"].mean()
+        sell_price = sell_window["Preis_EUR_MWh"].mean() + cfg["markup"]
 
-        # Dynamisches Netzentgelt
-        peak_mask = sell_window["Zeit"].dt.hour.between(8, 20)
-        net_cost = (energy_charged * netzentgelt_offpeak + energy_charged * peak_mask.mean() * (netzentgelt_peak - netzentgelt_offpeak))
+        charged = cfg["capacity"] * (1 + cfg["charge_loss"])
+        sold = cfg["capacity"] * (1 - cfg["discharge_loss"])
 
-        tagesgewinn = umsatz - energiekosten - net_cost
+        revenue = sold * sell_price
+        energy_cost = charged * buy_price
 
-        # CO₂ Bilanz
-        if not lade_hours["CO2_g_per_kWh"].isna().all() and not sell_window["CO2_g_per_kWh"].isna().all():
-            co2_load = (lade_hours["CO2_g_per_kWh"].mean() * energy_charged) / 1000  # kg
-            co2_sell = (sell_window["CO2_g_per_kWh"].mean() * energy_sold) / 1000
-            co2_saved = max(co2_sell - co2_load, 0)
-        else:
-            co2_saved = np.nan
+        # Netzentgelt (Peak = 08‑20 Uhr)
+        peak_ratio = sell_window["Zeit"].dt.hour.between(8, 20).mean()
+        net_cost = charged * (peak_ratio * cfg["net_peak"] + (1 - peak_ratio) * cfg["net_off"])
 
-        zyklen += 1
+        daily_profit = revenue - energy_cost - net_cost
+
+        # CO₂
+        co2_load = (load_hours["CO2_g_per_kWh"].mean() * charged) / 1000 if not load_hours["CO2_g_per_kWh"].isna().all() else np.nan
+        co2_sell = (sell_window["CO2_g_per_kWh"].mean() * sold) / 1000 if not sell_window["CO2_g_per_kWh"].isna().all() else np.nan
+        co2_saved = max(co2_sell - co2_load, 0) if (not np.isnan(co2_load) and not np.isnan(co2_sell)) else np.nan
+
+        cycles += 1
         results.append({
-            "Datum": datum,
-            "Einkaufspreis": avg_buy_price,
-            "Verkaufspreis": avg_sell_price,
-            "Tagesgewinn_EUR": tagesgewinn,
-            "CO2_saved_kg": co2_saved
+            "Datum": pd.to_datetime(d),
+            "Gewinn_EUR": daily_profit,
+            "CO2_saved_kg": co2_saved,
         })
 
-    df_result = pd.DataFrame(results)
+    df = pd.DataFrame(results)
 
-    # Batterie‑Kosten linear über Zyklen
-    zyklus_cost = batteriekosten / max_zyklen
-    deg_cost = zyklen * zyklus_cost
-    total_costs = deg_cost + betriebskosten
-    df_result["Netto_Jahresgewinn_EUR"] = df_result["Tagesgewinn_EUR"].sum() - total_costs
-    return df_result
+    # Kosten & Finanzierung
+    cy_cost = cfg["capex"] / cfg["max_cycles"]
+    deg_cost = cycles * cy_cost
+
+    if cfg["fin_model"] == "Kauf":
+        fin_annual = 0  # Capex bereits berücksichtigt im Deg-Kosten
+    elif cfg["fin_model"] == "Kredit":
+        r = cfg["loan_rate"]
+        n = cfg["loan_years"]
+        annuity = cfg["capex"] * (r * (1 + r) ** n) / ((1 + r) ** n - 1)
+        fin_annual = annuity
+    else:  # Leasing
+        fin_annual = cfg["lease_month"] * 12
+
+    op_cost = cfg["opex"]
+    total_extra_cost = deg_cost + fin_annual + op_cost
+
+    summary = {
+        "cycles": cycles,
+        "deg_cost": deg_cost,
+        "fin_annual": fin_annual,
+        "opex": op_cost,
+        "total_extra_cost": total_extra_cost,
+        "gross_profit": df["Gewinn_EUR"].sum(),
+        "net_profit": df["Gewinn_EUR"].sum() - total_extra_cost,
+        "co2_saved_total": df["CO2_saved_kg"].sum()
+    }
+
+    return df, summary
 
 # -----------------------------------------------------------------------------
-# 🚀 Streamlit App (main)
+# 🚀 Streamlit Frontend
 # -----------------------------------------------------------------------------
 
 def main():
-    st.set_page_config(page_title="🔋 Stromspeicher Simulator – Live API", layout="wide")
-    st.title("🔋 Stromspeicher Simulator – Live Spotmarkt & CO₂")
+    st.set_page_config(page_title="🔋 Stromspeicher – Finanz & Heatmaps", layout="wide")
+    st.title("🔋 Stromspeicher Simulator v3 – Live‑Preise, Finanzierung & Heatmaps")
 
-    st.sidebar.header("🔑 API & Basisdaten")
-    api_key_input = st.sidebar.text_input("ENTSO‑E API‑Key", value=os.getenv("ENTSOE_API_KEY", ""), type="password")
+    # Sidebar Basics
+    api_key = st.sidebar.text_input("ENTSO‑E API‑Key", os.getenv("ENTSOE_API_KEY", ""), type="password")
+    year = st.sidebar.selectbox("Jahr", [2023, 2024, 2025], index=0)
 
-    jahr = st.sidebar.selectbox("Jahr auswählen", options=[2023, 2024, 2025], index=0)
-    start_date = dt.datetime(jahr, 1, 1)
-    end_date = dt.datetime(jahr, 12, 31, 23, 59)
+    # Batterie
+    st.sidebar.header("🔋 Batterie")
+    cap = st.sidebar.number_input("Speichergröße (MWh)", 0.5, 20.0, 3.5, 0.1)
+    conn = st.sidebar.number_input("Netzanschluss (MW)", 0.1, 5.0, 0.35, 0.05)
+    ch_loss = st.sidebar.slider("Ladeverlust %", 0, 20, 5) / 100
+    dis_loss = st.sidebar.slider("Entladeverlust %", 0, 20, 5) / 100
+    markup = st.sidebar.number_input("Aufschlag EUR/MWh", 0, 500, 240, 10)
 
-    with st.sidebar.expander("🔋 Batterieparameter"):
-        speicher_mwh = st.number_input("Speichergröße (MWh)", 0.5, 20.0, 3.5, 0.1)
-        anschluss_mw = st.number_input("Netzanschluss (MW)", 0.1, 5.0, 0.35, 0.05)
-        ladeverlust = st.slider("Ladeverlust %", 0, 20, 5) / 100
-        entladeverlust = st.slider("Entladeverlust %", 0, 20, 5) / 100
-        aufschlag_eur_mwh = st.number_input("Verkaufsaufschlag (EUR/MWh)", 0, 500, 240, 10)
+    # Finanzierung
+    st.sidebar.header("💰 Finanzierung")
+    fin_model = st.sidebar.selectbox("Modell", ["Kauf", "Kredit", "Leasing"], index=0)
+    capex = st.sidebar.number_input("Capex Batterie (€)", 10000, 2000000, 350000, 5000)
+    max_cycles = st.sidebar.number_input("Max Zyklen", 1000, 15000, 6000, 100)
+    opex = st.sidebar.number_input("Opex/Jahr (€)", 0, 50000, 5000, 500)
 
-    with st.sidebar.expander("📦 Finanzierung & Kosten"):
-        batteriekosten = st.number_input("Batteriekosten (€)", 10000, 1000000, 350000, 5000)
-        max_zyklen = st.number_input("Max. Ladezyklen", 1000, 15000, 6000, 100)
-        betriebskosten = st.number_input("Betriebskosten/Jahr (€)", 0, 50000, 5000, 500)
-        degradation_pro_zyklus = st.slider("Degradation pro Zyklus %", 0.0, 0.2, 0.05) / 100
+    loan_rate = st.sidebar.number_input("Kredit‑Zins %", 0.0, 15.0, 4.0, 0.1)/100 if fin_model == "Kredit" else 0
+    loan_years = st.sidebar.number_input("Kredit‑Laufzeit (J)", 1, 20, 10, 1) if fin_model == "Kredit" else 0
+    lease_month = st.sidebar.number_input("Leasingrate €/Monat", 0, 20000, 3000, 100) if fin_model == "Leasing" else 0
 
-    with st.sidebar.expander("💡 Netzentgeltmodell"):
-        net_peak = st.number_input("Netzentgelt Peak (€/MWh)", 0, 200, 75, 5)
-        net_off = st.number_input("Netzentgelt Off‑Peak (€/MWh)", 0, 200, 40, 5)
+    # Netzentgelt
+    st.sidebar.header("🔌 Netzentgelte")
+    net_peak = st.sidebar.number_input("Peak (€/MWh)", 0, 200, 75, 5)
+    net_off = st.sidebar.number_input("Off‑Peak (€/MWh)", 0, 200, 40, 5)
 
-    verkauf_von = st.sidebar.time_input("Verkauf ab", value=dt.time(16, 30))
-    verkauf_bis = st.sidebar.time_input("Verkauf bis", value=dt.time(6, 0))
+    # Verkauf
+    st.sidebar.header("🕑 Verkauf")
+    sell_start = st.sidebar.time_input("Start", dt.time(16, 30))
+    sell_end = st.sidebar.time_input("Ende", dt.time(6, 0))
 
     if st.button("Simulation starten"):
-        with st.spinner("Daten werden geladen …"):
-            prices = fetch_day_ahead_prices(start_date, end_date, api_key=api_key_input)
-            co2 = fetch_co2_intensity(start_date, end_date, api_key=api_key_input)
+        start = dt.datetime(year, 1, 1)
+        end = dt.datetime(year, 12, 31, 23, 0)
+        with st.spinner("API‑Daten abrufen …"):
+            prices = fetch_day_ahead_prices(start, end, api_key)
+            co2 = fetch_co2_intensity(start, end, api_key)
 
-        df_result = battery_simulation(prices, co2, speicher_mwh, anschluss_mw, ladeverlust,
-                                        entladeverlust, aufschlag_eur_mwh, verkauf_von, verkauf_bis,
-                                        max_zyklen, batteriekosten, betriebskosten,
-                                        degradation_pro_zyklus, net_peak, net_off)
+        cfg = {
+            "capacity": cap,
+            "connection": conn,
+            "charge_loss": ch_loss,
+            "discharge_loss": dis_loss,
+            "markup": markup,
+            "sell_start": sell_start,
+            "sell_end": sell_end,
+            "capex": capex,
+            "max_cycles": max_cycles,
+            "opex": opex,
+            "fin_model": fin_model,
+            "loan_rate": loan_rate,
+            "loan_years": loan_years,
+            "lease_month": lease_month,
+            "net_peak": net_peak,
+            "net_off": net_off,
+        }
 
-        st.success("Simulation abgeschlossen")
+        df, summary = simulate(prices, co2, cfg)
+        st.success("Simulation fertig ✔️")
 
-        kpi1, kpi2, kpi3 = st.columns(3)
-        kpi1.metric("Ø Tagesgewinn", f"{df_result['Tagesgewinn_EUR'].mean():.2f} €")
-        kpi2.metric("Gesamter Gewinn", f"{df_result['Tagesgewinn_EUR'].sum():.0f} €")
-        kpi3.metric("CO₂‑Einsparung (kg)", f"{df_result['CO2_saved_kg'].sum():.0f}")
+        # KPIs
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Brutto‑Gewinn €", f"{summary['gross_profit']:,.0f}")
+        k2.metric("Kosten €", f"{summary['total_extra_cost']:,.0f}")
+        k3.metric("Netto‑Gewinn €", f"{summary['net_profit']:,.0f}")
+        k4.metric("Zyklen", summary['cycles'])
 
-        fig, ax = plt.subplots(figsize=(10, 5))
-        ax.hist(df_result["Tagesgewinn_EUR"], bins=30, edgecolor="black")
-        ax.set_title("Verteilung Tagesgewinne")
-        ax.set_xlabel("Gewinn €")
-        ax.set_ylabel("Anzahl Tage")
-        st.pyplot(fig)
+        # Monats‑Cashflow
+        df_month = df.set_index("Datum").resample("M").sum()
+        monthly_cost = summary['total_extra_cost'] / 12
+        df_month["Net_Cashflow"] = df_month["Gewinn_EUR"] - monthly_cost
 
-        st.subheader("Detailergebnisse")
-        st.dataframe(df_result)
+        st.subheader("📊 Monats‑Cashflow")
+        fig2, ax2 = plt.subplots(figsize=(9, 4))
+        ax2.bar(df_month.index.strftime("%b"), df_month["Net_Cashflow"], color="tab:blue")
+        ax2.set_ylabel("€")
+        ax2.set_title("Netto‑Cashflow pro Monat")
+        ax2.axhline(0, color="black", linewidth=0.8)
+        st.pyplot(fig2)
 
-        st.download_button("CSV herunterladen", df_result.to_csv(index=False).encode(), file_name="simulation_ergebnisse.csv")
+        # Heatmap täglicher Gewinne
+        st.subheader("🔥 Heatmap Tages­gewinne")
+        df_heat = df.copy()
+        df_heat["Monat"] = df_heat["Datum"].dt.month
+        df_heat["Tag"] = df_heat["Datum"].dt.day
+        pivot = df_heat.pivot_table(index="Monat", columns="Tag", values="Gewinn_EUR", aggfunc="sum")
+        fig3, ax3 = plt.subplots(figsize=(12, 4))
+        im = ax3.imshow(pivot, aspect="auto", cmap="RdYlGn")
+        ax3.set_yticks(np.arange(0, 12))
+        ax3.set_yticklabels([dt.date(1900, m, 1).strftime("%b") for m in range(1, 13)])
+        ax3.set_xlabel("Tag im Monat")
+        ax3.set_title("Tägliche Gewinne – Heatmap")
+        fig3.colorbar(im, ax=ax3, label="€")
+        st.pyplot(fig3)
 
+        st.subheader("🔍 Detailtabelle")
+        st.dataframe(df.round(2))
+        st.download_button("CSV herunterladen", df.to_csv(index=False).encode(), file_name="sim_detail.csv")
 
 if __name__ == "__main__":
     main()
